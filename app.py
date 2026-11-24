@@ -61,16 +61,111 @@ def clean_name(value):
         return ""
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
-# Build a player-name -> photo URL lookup from the image column already in your Excel file.
+def canonical_player_name(value):
+    """Normalize tournament name variants without merging different players."""
+    if pd.isna(value):
+        return ""
+    name = re.sub(r"\s+", " ", str(value)).strip()
+    # Remove common role/captain annotations, not parts of actual names.
+    name = re.sub(r"\s*\((?:c|wk|vc)\)\s*$", "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"\s+(?:WK|C|VC)\s*$", "", name, flags=re.IGNORECASE).strip()
+    aliases = {
+        "kohli": "Virat Kohli",
+        "virat kohli": "Virat Kohli",
+        "rohit": "Rohit Sharma",
+        "rohit sharma": "Rohit Sharma",
+    }
+    return aliases.get(name.casefold(), name)
+
+def aggregate_player_stats(frame, kind):
+    """Combine duplicate name variants and recalculate rate statistics."""
+    if frame.empty or "player_name" not in frame.columns:
+        return frame
+    data = frame.copy()
+    data["player_name"] = data["player_name"].map(canonical_player_name)
+    numeric = [c for c in data.columns if c not in ("player_name", "team")]
+    for col in numeric:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    agg = {col: "sum" for col in numeric}
+    if "team" in data.columns:
+        agg["team"] = "first"
+    result = data.groupby("player_name", as_index=False).agg(agg)
+    if kind == "batting" and {"total_runs", "total_balls"}.issubset(result.columns):
+        result["strike_rate"] = (
+            result["total_runs"] / result["total_balls"].replace(0, pd.NA) * 100
+        ).fillna(0)
+    if kind == "bowling" and {"total_runs_conceded", "total_balls"}.issubset(result.columns):
+        result["economy"] = (
+            result["total_runs_conceded"] / (result["total_balls"].replace(0, pd.NA) / 6)
+        ).fillna(0)
+    return result
+
+# The source workbook contains split name variants such as "Kohli" and
+# "Virat Kohli", and "Rohit (c)" and "Rohit Sharma (c)".
+batting = aggregate_player_stats(batting, "batting")
+bowling = aggregate_player_stats(bowling, "bowling")
+
+# Build photo lookup from the Player_Information sheet.
+# Store both the original and canonical keys so aliases still find the right image.
 photo_lookup = {}
 if {"player_name", "image"}.issubset(players.columns):
-    for _, row in players.dropna(subset=["image"]).iterrows():
-        key = clean_name(row["player_name"])
-        if key and key not in photo_lookup:
-            photo_lookup[key] = str(row["image"]).strip()
+    for _, player_row in players.dropna(subset=["image"]).iterrows():
+        image_url = str(player_row["image"]).strip()
+        if not image_url:
+            continue
+        original_key = clean_name(player_row["player_name"])
+        canonical_key = clean_name(canonical_player_name(player_row["player_name"]))
+        if original_key:
+            photo_lookup.setdefault(original_key, image_url)
+        if canonical_key:
+            photo_lookup.setdefault(canonical_key, image_url)
 
 def get_photo(name):
-    return photo_lookup.get(clean_name(name), None)
+    return photo_lookup.get(clean_name(canonical_player_name(name)), None)
+
+@st.dialog("🏏 Player Career Profile", width="large")
+def player_profile_popup(name):
+    """Show the player details and statistics available in the supplied workbook."""
+    key = clean_name(name)
+    p_row = players[players["player_name"].astype(str).map(lambda x: clean_name(canonical_player_name(x))) == key] if "player_name" in players else pd.DataFrame()
+    b_row = batting[batting["player_name"].astype(str).map(lambda x: clean_name(canonical_player_name(x))) == key] if "player_name" in batting else pd.DataFrame()
+    w_row = bowling[bowling["player_name"].astype(str).map(lambda x: clean_name(canonical_player_name(x))) == key] if "player_name" in bowling else pd.DataFrame()
+
+    left, right = st.columns([1, 2])
+    with left:
+        photo = get_photo(name)
+        if photo:
+            st.image(photo, use_container_width=True)
+        else:
+            st.markdown("## 🏏")
+    with right:
+        st.subheader(name)
+        if not p_row.empty:
+            info = p_row.iloc[0]
+            st.write(f"**Team:** {info.get('team', 'N/A')}")
+            st.write(f"**Role:** {info.get('role_clean', info.get('role', 'N/A'))}")
+            st.write(f"**Batting style:** {info.get('batting_style_clean', info.get('batting_style', 'N/A'))}")
+            st.write(f"**Bowling style:** {info.get('bowling_style', 'N/A')}")
+
+    st.divider()
+    st.caption("Statistics below come from the tournament workbook currently connected to this dashboard. They are not full-career totals.")
+    if not b_row.empty:
+        bat = b_row.iloc[0]
+        st.markdown("#### 🏏 Batting (available tournament data)")
+        m = st.columns(4)
+        for col, label, field in zip(m, ["Runs", "Strike rate", "Innings", "Balls faced"], ["total_runs", "strike_rate", "innings", "total_balls"]):
+            val = bat.get(field, "N/A")
+            col.metric(label, f"{val:,.2f}" if isinstance(val, (int, float)) and pd.notna(val) else str(val))
+    if not w_row.empty:
+        bowl = w_row.iloc[0]
+        st.markdown("#### 🎯 Bowling (available tournament data)")
+        m = st.columns(4)
+        for col, label, field in zip(m, ["Wickets", "Economy", "Matches", "Balls bowled"], ["total_wickets", "economy", "matches", "total_balls"]):
+            val = bowl.get(field, "N/A")
+            col.metric(label, f"{val:,.2f}" if isinstance(val, (int, float)) and pd.notna(val) else str(val))
+    if b_row.empty and w_row.empty:
+        st.info("No batting or bowling record for this player was found in the current workbook.")
+    st.info("To show complete T20 career stats and recalculate an all-time Best XI, we need a separate all-career T20 dataset. The current workbook contains tournament analysis only.")
 
 def show_player_cards(df, name_col, subtitle_col=None, max_cards=10, image_width=140):
     """Show player photos and names in a responsive row of Streamlit columns."""
@@ -95,6 +190,8 @@ def show_player_cards(df, name_col, subtitle_col=None, max_cards=10, image_width
                 st.markdown(f"**{name}**")
                 if subtitle_col and subtitle_col in player.index and pd.notna(player[subtitle_col]):
                     st.caption(str(player[subtitle_col]))
+                if st.button("View profile", key=f"profile_{clean_name(name)}_{start}", use_container_width=True):
+                    player_profile_popup(name)
 
 def metric_sum(df, col):
     if col not in df.columns:
@@ -207,7 +304,8 @@ elif page == "Best Playing XI":
         ] if c in best_xi.columns]
         st.subheader("Best XI performance")
         st.dataframe(best_xi[display_cols], use_container_width=True, hide_index=True)
-        st.caption("The table uses the Best XI selection already present in your supplied workbook.")
+        st.caption("This XI is the selection already present in your supplied tournament workbook; it is not yet an all-time career-based XI.")
+        st.warning("The workbook does not contain complete career statistics. Upload an all-time T20 career dataset before we replace this with a genuine career-based Best XI.")
 
 elif page == "Player Explorer":
     st.title("🔎 Player Explorer")
@@ -238,6 +336,8 @@ elif page == "Player Explorer":
                         st.write(f"**Role:** {player.get('role_clean', player.get('role', 'N/A'))}")
                         st.write(f"**Batting:** {player.get('batting_style_clean', player.get('batting_style', 'N/A'))}")
                         st.write(f"**Bowling:** {player.get('bowling_style', 'N/A')}")
+                        if st.button("View career profile", key=f"explorer_{clean_name(player.get('player_name', 'Unknown'))}", use_container_width=True):
+                            player_profile_popup(str(player.get('player_name', 'Unknown')))
     else:
         st.dataframe(players, use_container_width=True, hide_index=True)
 
